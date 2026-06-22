@@ -1,0 +1,13 @@
+[project]
+name = "pic2webp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "customtkinter>=5.2.2",
+    "pillow>=12.2.0",
+    "py7zr>=1.1.3",
+    "rarfile>=4.2",
+    "tkinterdnd2>=0.5.0",
+]
