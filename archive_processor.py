@@ -36,7 +36,11 @@ def is_image_file(file_path):
     ファイルが画像ファイル（Pillowで開けるか）どうかを判定します。
     """
     # 拡張子での簡易チェック（速度向上のため）
-    valid_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif"}
+    valid_extensions = {
+        ".jpg", ".jpeg", ".jfif", ".png", ".webp", 
+        ".bmp", ".dib", ".tiff", ".tif", ".gif", 
+        ".tga", ".ico", ".sgi"
+    }
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in valid_extensions:
         return False
