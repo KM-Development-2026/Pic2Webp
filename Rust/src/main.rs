@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod config;
 mod processor;
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Stroke};
@@ -24,6 +25,7 @@ struct App {
     rx: Receiver<Msg>,
     processing: bool,
     quality: u8,
+    config: config::Config,
     log: String,
     status: String,
     progress: f32,
@@ -51,6 +53,7 @@ impl App {
             rx,
             processing: false,
             quality: 50,
+            config: config::Config::load(),
             log: String::new(),
             status: "処理待機中...".into(),
             progress: 0.0,
@@ -62,8 +65,18 @@ impl App {
         self.processing = true;
         self.progress = 0.0;
         self.last_dir = None;
-        let (tx, ctx, q) = (self.tx.clone(), ctx.clone(), self.quality as f32);
-        std::thread::spawn(move || worker(paths, q, tx, ctx));
+        let (tx, ctx, q, th) =
+            (self.tx.clone(), ctx.clone(), self.quality as f32, self.config.threads);
+        std::thread::spawn(move || {
+            // パニック時も UI が処理中のまま固まらないようエラーを通知する
+            let (tx2, ctx2) = (tx.clone(), ctx.clone());
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(paths, q, th, tx, ctx)))
+                .is_err()
+            {
+                let _ = tx2.send(Msg::Error("内部エラー（パニック）が発生しました。".into()));
+                ctx2.request_repaint();
+            }
+        });
     }
 
     fn drain(&mut self) {
@@ -88,7 +101,7 @@ impl App {
     }
 }
 
-fn worker(paths: Vec<PathBuf>, quality: f32, tx: Sender<Msg>, ctx: egui::Context) {
+fn worker(paths: Vec<PathBuf>, quality: f32, threads: usize, tx: Sender<Msg>, ctx: egui::Context) {
     let send = |m: Msg| {
         let _ = tx.send(m);
         ctx.request_repaint();
@@ -124,6 +137,7 @@ fn worker(paths: Vec<PathBuf>, quality: f32, tx: Sender<Msg>, ctx: egui::Context
         let res = processor::process_single_archive(
             path,
             quality,
+            threads,
             &|m| send(Msg::Log(m + "\n")),
             &|cur, tot| {
                 let inner = if tot > 0 { cur as f32 / tot as f32 / total as f32 } else { 0.0 };
@@ -205,6 +219,21 @@ impl eframe::App for App {
                         .suffix("%")
                         .text("WebP 圧縮品質"),
                 );
+
+                // 並列数 (0 = 自動)。変更したら設定ファイルへ保存
+                let before = self.config.threads;
+                let max = config::resolve_threads(0).max(self.config.threads);
+                ui.add_enabled(
+                    !self.processing,
+                    egui::Slider::new(&mut self.config.threads, 0..=max)
+                        .custom_formatter(|n, _| {
+                            if n == 0.0 { "自動".to_string() } else { format!("{n}") }
+                        })
+                        .text("並列数"),
+                );
+                if self.config.threads != before {
+                    self.config.save();
+                }
 
                 // 進捗
                 ui.label(RichText::new(&self.status).size(12.0));

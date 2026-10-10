@@ -1,14 +1,16 @@
 //! archive_processor.py の Rust 移植。
 use anyhow::{anyhow, bail, Context, Result};
 use std::os::windows::process::CommandExt;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs, io};
 use walkdir::WalkDir;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const IMAGE_EXTS: &[&str] = &[
-    "jpg", "jpeg", "jfif", "png", "webp", "bmp", "dib", "tiff", "tif", "gif", "tga", "ico", "sgi",
+    "jpg", "jpeg", "jfif", "png", "webp", "bmp", "dib", "tiff", "tif", "gif", "tga", "ico",
 ];
 
 fn ext_lower(p: &Path) -> String {
@@ -65,7 +67,10 @@ fn extract_archive(archive: &Path, dest: &Path, rar_tool: Option<&Path>) -> Resu
                 anyhow!("RARファイルの展開に必要な外部ツール（7-Zip または WinRAR）が見つかりません。")
             })?;
             fs::create_dir_all(dest)?;
-            let is_7z = tool.to_string_lossy().to_lowercase().contains("7z");
+            let is_7z = tool
+                .file_stem()
+                .map(|n| n.to_string_lossy().to_lowercase().starts_with("7z"))
+                .unwrap_or(false);
             let mut cmd = Command::new(tool);
             if is_7z {
                 cmd.arg("x").arg("-y").arg(format!("-o{}", dest.display())).arg(archive);
@@ -83,46 +88,102 @@ fn extract_archive(archive: &Path, dest: &Path, rar_tool: Option<&Path>) -> Resu
     Ok(())
 }
 
-/// 1枚の画像を WebP に変換（元が .webp 以外なら元ファイルを削除）
-fn convert_one(path: &Path, quality: f32) -> Result<()> {
+/// 1枚の画像を `out` へ WebP として保存（元ファイルは削除しない）
+fn convert_one(path: &Path, out: &Path, quality: f32) -> Result<()> {
     let img = image::ImageReader::open(path)?.with_guessed_format()?.decode()?;
     let (w, h) = (img.width(), img.height());
-    let data = if img.color().has_alpha() {
-        let buf = img.to_rgba8();
-        webp::Encoder::from_rgba(&buf, w, h).encode(quality).to_vec()
+    let mem = if img.color().has_alpha() {
+        let buf = img.into_rgba8();
+        webp::Encoder::from_rgba(&buf, w, h).encode(quality)
     } else {
-        let buf = img.to_rgb8();
-        webp::Encoder::from_rgb(&buf, w, h).encode(quality).to_vec()
+        let buf = img.into_rgb8();
+        webp::Encoder::from_rgb(&buf, w, h).encode(quality)
     };
-    fs::write(path.with_extension("webp"), data)?;
-    if ext_lower(path) != "webp" {
-        fs::remove_file(path)?;
-    }
+    fs::write(out, &*mem)?;
     Ok(())
 }
 
-/// 画像はWebPに変換、それ以外（変換失敗含む）は削除
-fn convert_images_in_dir(dir: &Path, quality: f32, progress: &dyn Fn(usize, usize)) -> usize {
+/// 変換後の出力パスを決める。既存ファイルや他画像の出力と衝突する場合は
+/// `元名.拡張子.webp`（さらに衝突すれば連番）にして上書きを避ける。
+fn unique_webp_path(path: &Path, taken: &mut HashSet<PathBuf>) -> PathBuf {
+    let mut cand = path.with_extension("webp");
+    if taken.contains(&cand) || cand.exists() {
+        let base = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        cand = path.with_file_name(format!("{base}.webp"));
+        let mut n = 2;
+        while taken.contains(&cand) || cand.exists() {
+            cand = path.with_file_name(format!("{base}.{n}.webp"));
+            n += 1;
+        }
+    }
+    taken.insert(cand.clone());
+    cand
+}
+
+/// 画像はWebPに変換、画像以外は削除。変換に失敗した画像は元ファイルを残す。
+fn convert_images_in_dir(
+    dir: &Path,
+    quality: f32,
+    threads: usize,
+    log: &(dyn Fn(String) + Sync),
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> usize {
     let files: Vec<PathBuf> = WalkDir::new(dir)
         .into_iter()
         .flatten()
         .filter(|e| !e.file_type().is_dir())
         .map(|e| e.into_path())
         .collect();
-    let total = files.len();
-    let mut converted = 0;
 
-    for (i, path) in files.iter().enumerate() {
-        progress(i + 1, total);
-        let looks_image = IMAGE_EXTS.contains(&ext_lower(path).as_str());
-        if looks_image && convert_one(path, quality).is_ok() {
-            converted += 1;
+    // 画像以外は先に削除し、変換対象 (入力, 出力) を決定する（出力名の衝突はここで解決）
+    let mut taken: HashSet<PathBuf> = HashSet::new();
+    let mut jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut kept = 0; // 変換不要（元から .webp）の枚数
+    for path in files {
+        let ext = ext_lower(&path);
+        if !IMAGE_EXTS.contains(&ext.as_str()) {
+            let _ = fs::remove_file(&path);
+        } else if ext == "webp" {
+            taken.insert(path);
+            kept += 1;
         } else {
-            let _ = fs::remove_file(path);
+            jobs.push((path, PathBuf::new()));
         }
     }
+    for job in jobs.iter_mut() {
+        job.1 = unique_webp_path(&job.0, &mut taken);
+    }
+
+    let total = jobs.len();
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let converted = AtomicUsize::new(0);
+    let workers = crate::config::resolve_threads(threads).min(total.max(1));
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some((src, out)) = jobs.get(i) else { break };
+                match convert_one(src, out, quality) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(src);
+                        converted.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        let _ = fs::remove_file(out);
+                        log(format!(
+                            "[警告] 変換に失敗したため元画像を残します: {} ({e})",
+                            src.file_name().unwrap_or_default().to_string_lossy()
+                        ));
+                    }
+                }
+                progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
+            });
+        }
+    });
     clean_empty_directories(dir);
-    converted
+    converted.into_inner() + kept
 }
 
 fn create_zip_archive(src: &Path, out_zip: &Path) -> Result<()> {
@@ -131,7 +192,7 @@ fn create_zip_archive(src: &Path, out_zip: &Path) -> Result<()> {
     }
     let mut zw = zip::ZipWriter::new(fs::File::create(out_zip)?);
     let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_method(zip::CompressionMethod::Stored)
         .large_file(true);
     for e in WalkDir::new(src).into_iter().flatten().filter(|e| e.file_type().is_file()) {
         let rel = e.path().strip_prefix(src)?;
@@ -156,8 +217,9 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
 pub fn process_single_archive(
     archive: &Path,
     quality: f32,
-    log: &dyn Fn(String),
-    progress: &dyn Fn(usize, usize),
+    threads: usize,
+    log: &(dyn Fn(String) + Sync),
+    progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<PathBuf> {
     let name = archive.file_name().unwrap().to_string_lossy().to_string();
     log(format!("【処理開始】 {name}"));
@@ -192,7 +254,7 @@ pub fn process_single_archive(
     extract_archive(archive, work.path(), rar_tool.as_deref())?;
 
     log("画像をWebPに変換し、不要ファイルを削除中...".into());
-    let converted = convert_images_in_dir(work.path(), quality, progress);
+    let converted = convert_images_in_dir(work.path(), quality, threads, log, progress);
     log(format!("画像変換完了: {converted} 枚の画像を処理しました。"));
 
     let stem = archive.file_stem().unwrap().to_string_lossy().to_string();
@@ -221,4 +283,33 @@ pub fn process_single_archive(
 
     log(format!("【処理成功】 {name}\n"));
     Ok(final_zip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 出力名の衝突を避ける() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut taken = HashSet::new();
+        let a = unique_webp_path(&dir.path().join("a.png"), &mut taken);
+        let b = unique_webp_path(&dir.path().join("a.jpg"), &mut taken);
+        assert_eq!(a, dir.path().join("a.webp"));
+        assert_eq!(b, dir.path().join("a.jpg.webp"));
+    }
+
+    #[test]
+    fn 変換と失敗時の挙動() {
+        let dir = tempfile::tempdir().unwrap();
+        image::RgbImage::new(4, 4).save(dir.path().join("ok.png")).unwrap();
+        fs::write(dir.path().join("broken.jpg"), b"not an image").unwrap();
+        fs::write(dir.path().join("note.txt"), b"x").unwrap();
+        let n = convert_images_in_dir(dir.path(), 80.0, 2, &|_| {}, &|_, _| {});
+        assert_eq!(n, 1);
+        assert!(dir.path().join("ok.webp").exists());
+        assert!(!dir.path().join("ok.png").exists());
+        assert!(dir.path().join("broken.jpg").exists()); // 失敗した元画像は残る
+        assert!(!dir.path().join("note.txt").exists());
+    }
 }
